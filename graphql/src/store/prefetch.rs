@@ -4,14 +4,14 @@
 use anyhow::{anyhow, Error};
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::iter::once;
 use std::rc::Rc;
 use std::time::Instant;
 
 use graph::prelude::{
-    q, s, ApiSchema, BlockNumber, ChildMultiplicity, EntityCollection, EntityFilter, EntityLink,
-    EntityOrder, EntityWindow, Logger, ParentLink, QueryExecutionError, QueryStore,
+    q, s, ApiSchema, BlockNumber, ChildMultiplicity, ColumnNames, EntityCollection, EntityFilter,
+    EntityLink, EntityOrder, EntityWindow, Logger, ParentLink, QueryExecutionError, QueryStore,
     Value as StoreValue, WindowAttribute,
 };
 use graph::{components::store::EntityType, data::graphql::*};
@@ -395,6 +395,7 @@ impl<'a> Join<'a> {
                     child_type: cond.child_type.to_owned(),
                     ids,
                     link,
+                    column_names: ColumnNames::All,
                 });
             }
         }
@@ -503,8 +504,17 @@ fn execute_selection_set<'a>(
             let grouped_field_set =
                 collect_fields(ctx, child_type, fields.iter().map(|f| &f.selection_set));
 
+            let column_names = collect_column_names(&grouped_field_set);
+
             match execute_field(
-                resolver, &ctx, type_cond, &parents, &join, &fields[0], field,
+                resolver,
+                &ctx,
+                type_cond,
+                &parents,
+                &join,
+                &fields[0],
+                field,
+                column_names,
             ) {
                 Ok(children) => {
                     match execute_selection_set(resolver, ctx, children, grouped_field_set) {
@@ -533,7 +543,7 @@ fn execute_selection_set<'a>(
 /// interface type and `iface_fields` the selected fields on the interface. `obj_types` are the
 /// fields selected on objects by fragments. In `collect_fields`, the `iface_fields` will then be
 /// merged into each entry in `obj_types`. See also: e0d6da3e-60cf-41a5-b83c-b60a7a766d4a
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct CollectedResponseKey<'a> {
     iface_cond: Option<&'a s::InterfaceType>,
     iface_fields: Vec<&'a q::Field>,
@@ -758,6 +768,7 @@ fn execute_field(
     join: &Join<'_>,
     field: &q::Field,
     field_definition: &s::Field,
+    column_names: ColumnNames,
 ) -> Result<Vec<Node>, Vec<QueryExecutionError>> {
     let argument_values = crate::execution::coerce_argument_values(&ctx.query, object_type, field)?;
 
@@ -778,6 +789,7 @@ fn execute_field(
         ctx.max_first,
         ctx.max_skip,
         ctx.query.query_id.clone(),
+        column_names,
     )
     .map_err(|e| vec![e])
 }
@@ -797,6 +809,7 @@ fn fetch(
     max_first: u32,
     max_skip: u32,
     query_id: String,
+    column_names: ColumnNames,
 ) -> Result<Vec<Node>, QueryExecutionError> {
     let mut query = build_query(
         join.child_type,
@@ -805,6 +818,7 @@ fn fetch(
         types_for_interface,
         max_first,
         max_skip,
+        column_names,
     )?;
     query.query_id = Some(query_id);
 
@@ -835,4 +849,61 @@ fn fetch(
     store
         .find_query_values(query)
         .map(|entities| entities.into_iter().map(|entity| entity.into()).collect())
+}
+
+fn collect_column_names(
+    grouped_field_set: &IndexMap<&std::string::String, CollectedResponseKey<'_>>,
+) -> ColumnNames {
+    fn push_schema_field(field: &s::Field, collection: &mut BTreeSet<String>) {
+        let is_derived = field
+            .directives
+            .iter()
+            .any(|dir| dir.name == String::from("derivedFrom"));
+        if !is_derived {
+            collection.insert(field.name.clone());
+        }
+    }
+
+    fn push_query_field(field: &q::Field, collection: &mut BTreeSet<String>) {
+        if !field.name.starts_with("__") {
+            collection.insert(field.name.to_string());
+        }
+    }
+
+    let mut schema_columns: BTreeSet<String> = BTreeSet::new();
+    let mut query_columns: BTreeSet<String> = BTreeSet::new();
+    for response_keys in grouped_field_set.values() {
+        for (obj_condition, fields) in &response_keys.obj_types {
+            // schema fields
+            for field in &obj_condition.0.fields {
+                push_schema_field(field, &mut schema_columns)
+            }
+
+            // query fields
+            for field in fields {
+                push_query_field(&field, &mut query_columns);
+                for item in &field.selection_set.items {
+                    match item {
+                        q::Selection::Field(inner_field) => {
+                            push_query_field(&inner_field, &mut query_columns);
+                        }
+                        _ => unimplemented!(),
+                    }
+                }
+            }
+        }
+    }
+
+    let intersection: Vec<String> = schema_columns
+        .intersection(&query_columns)
+        .cloned()
+        .collect();
+
+    if intersection.is_empty() {
+        // TODO: Explain why are we signaling that we must select all columns in this case?
+        // Wouldn't it be better to return an option here? Or an empty variant?
+        ColumnNames::All
+    } else {
+        ColumnNames::Select(intersection)
+    }
 }

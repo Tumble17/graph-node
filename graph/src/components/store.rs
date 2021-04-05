@@ -307,6 +307,7 @@ pub struct EntityWindow {
     pub ids: Vec<String>,
     /// How to get the parent id
     pub link: EntityLink,
+    pub column_names: ColumnNames,
 }
 
 /// The base collections from which we are going to get entities for use in
@@ -317,7 +318,7 @@ pub struct EntityWindow {
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntityCollection {
     /// Use all entities of the given types
-    All(Vec<EntityType>),
+    All(Vec<(EntityType, ColumnNames)>),
     /// Use entities according to the windows. The set of entities that we
     /// apply order and range to is formed by taking all entities matching
     /// the window, and grouping them by the attribute of the window. Entities
@@ -434,7 +435,10 @@ impl EntityQuery {
                             }
                         };
                         self.filter = Some(filter.and_maybe(self.filter));
-                        self.collection = EntityCollection::All(vec![window.child_type.to_owned()]);
+                        self.collection = EntityCollection::All(vec![(
+                            window.child_type.to_owned(),
+                            window.column_names.clone(),
+                        )]);
                     }
                 }
             }
@@ -1749,4 +1753,13 @@ impl LfuCache<EntityKey, Option<Entity>> {
             Some(data) => Ok(data.to_owned()),
         }
     }
+}
+
+/// Determines which columns should be selected in a table.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ColumnNames {
+    /// Select all columns. Equivalent to a `"SELECT *"`.
+    All,
+    /// Individual column names to be selected.
+    Select(Vec<String>),
 }
