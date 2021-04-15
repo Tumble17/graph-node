@@ -7,7 +7,7 @@ use diesel::{
 use graph::{
     prelude::{
         anyhow::{self, anyhow, bail},
-        debug, error, info, o,
+        crit, debug, error, info, o,
         tokio::sync::Semaphore,
         CancelGuard, CancelHandle, CancelToken as _, CancelableError, Counter, Gauge, Logger,
         MetricsRegistry, MovingStats, PoolWaitStats, StoreError,
@@ -449,34 +449,51 @@ impl ConnectionPool {
             migrate: bool,
         }
 
+        fn die(logger: &Logger, msg: &'static str, err: &dyn std::fmt::Display) -> ! {
+            crit!(logger, "{}", msg; "error" => err.to_string());
+            panic!("{}: {}", msg, err);
+        }
+
         let pool = self.clone();
-        self.with_conn(move |conn, _| {
-            // Get an advisory session-level lock. The graph-node process
-            // that acquires the lock will run the migration. Everybody else
-            // will skip running migrations.
-            //
-            // We use two locks: one so we can tell whether we were the
-            // lucky ones that should run the migration, and one that blocks
-            // every process that is not running migrations until the
-            // migration is finished
-            let lock = sql_query("select pg_try_advisory_lock(1) as migrate, pg_advisory_lock(2)")
+        let res = self
+            .with_conn(move |conn, _| {
+                // Get an advisory session-level lock. The graph-node process
+                // that acquires the lock will run the migration. Everybody else
+                // will skip running migrations.
+                //
+                // We use two locks: one so we can tell whether we were the
+                // lucky ones that should run the migration, and one that blocks
+                // every process that is not running migrations until the
+                // migration is finished
+                let lock = match sql_query(
+                    "select pg_try_advisory_lock(1) as migrate, pg_advisory_lock(2)",
+                )
                 .get_result::<LockResult>(conn)
-                .expect("we can try to get advisory locks 1 and 2");
-            let result = if lock.migrate {
-                pool.configure_fdw(servers)
-                    .and_then(|_| migrate_schema(&pool.logger, conn))
-                    .and_then(|_| pool.map_primary())
-            } else {
+                {
+                    Ok(lock) => lock,
+                    Err(e) => die(&pool.logger, "failed to get migration locks", &e),
+                };
+                let result = if lock.migrate {
+                    pool.configure_fdw(servers)
+                        .and_then(|_| migrate_schema(&pool.logger, conn))
+                        .and_then(|_| pool.map_primary())
+                } else {
+                    Ok(())
+                };
+                if let Err(e) =
+                    sql_query("select pg_advisory_unlock(1), pg_advisory_unlock(2)").execute(conn)
+                {
+                    die(&pool.logger, "failed to release migration locks", &e);
+                }
+                if let Err(e) = result {
+                    die(&pool.logger, "migrations failed", &e);
+                }
                 Ok(())
-            };
-            sql_query("select pg_advisory_unlock(1), pg_advisory_unlock(2)")
-                .execute(conn)
-                .expect("we can unlock the advisory locks");
-            result.expect("migration succeeds");
-            Ok(())
-        })
-        .await
-        .expect("migrations are never canceled");
+            })
+            .await;
+        if let Err(e) = res {
+            die(&self.logger, "migrations were canceled", &e);
+        }
     }
 
     fn configure_fdw(&self, servers: Arc<Vec<ForeignServer>>) -> Result<(), StoreError> {
